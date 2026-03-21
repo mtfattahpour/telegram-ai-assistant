@@ -1,6 +1,6 @@
 # Telegram AI Assistant for Knowledge Synthesis
 
-A Python-based, event-driven tool for filtering and searching Telegram messages, with intelligent summarization and AI-assisted knowledge extraction. Users can query groups or channels in natural language and receive answers based on their content using a special chat inteface in Telegram app.
+A Python-based, event-driven tool for filtering and searching Telegram messages, with intelligent summarization and AI-assisted knowledge extraction. Users can query groups or channels in natural language and receive answers based on their content using a special chat interface in Telegram app.
 
 ## Project Motivation
 
@@ -59,7 +59,7 @@ This project is under active development. The ultimate goal is to build a featur
     * Create a file named `.env` in the root directory.
     * Add your Telegram API credentials to this file:
       ```
-      API_ID=1234567
+      API_ID=your_api_id_here
       API_HASH=your_api_hash_here
       ```
 6.  **Run the script:**
@@ -67,4 +67,9 @@ This project is under active development. The ultimate goal is to build a featur
     python create_session.py
     ```
     * On the first run, you will be prompted to enter your phone number, login code, and two-factor authentication password (if enabled). A `.session` file will be generated, which is a sensitive file that grants programmatic access to the Telegram account and should not be shared with anyone (this session can be terminated from mobile/desktop App at any time).
-    * Then run the `main.py` for execution to begin. The script will continue running until Ctrl+C is pressed or a special command `/stop` is sent to the chat inteface.
+    * **NOTE:** running `create_session` is not necessary since running `main.py` automatically creates a session file if it doesn't exist in the root directory.
+    * Then run the `main.py` for execution to begin. A new group will be created (if it doesn't exist), which is the interface to interact with the script. The script will continue running until Ctrl+C is pressed or a special command `/stop` is sent to the chat inteface.
+    ```bash
+    python main.py
+    ```
+    * The list of the commands and how to use the script is explained in the chat interface via `/help` command.
