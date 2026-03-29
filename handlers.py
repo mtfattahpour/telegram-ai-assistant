@@ -1,16 +1,21 @@
+import asyncio
 import json
 import logging
 import os
-import re
 
-import arabic_reshaper
-from bidi.algorithm import get_display
+from dotenv import load_dotenv
+from google import genai
 from telethon import TelegramClient, events
 
 log = logging.getLogger("assistant")
 
+load_dotenv()
+
 # State management for index-based fetching
 RECENT_CHATS = {}
+
+GEMINI_API_KEY = os.environ.get("GEMINI_API_KEY")
+genai_client = genai.Client(api_key=GEMINI_API_KEY)
 
 COMMANDS = {
     "/ping": (
@@ -32,6 +37,10 @@ COMMANDS = {
     "/fetch": (
         "Retrieve [N] messages from a list index and save to JSON.",
         "/fetch 1 50"
+    ),
+    "/ask": (
+        "Ask a question based on the last 1000 messages of a target chat.",
+        "/ask 1 What are the latest treatment protocols?"
     ),
     "/clean": (
         "Wipe all messages in this UI group.",
@@ -205,13 +214,6 @@ def register_handlers(client: TelegramClient, chat_id: int) -> None:
                 elif getattr(entity, 'username', None):
                     deep_link = f"https://t.me/{entity.username}/{msg.id}"
 
-                # # 3. Handle RTL text formatting (Persian/Arabic)
-                # text_content = msg.text if msg.text else ""
-                # # \u0600-\u06FF is the Unicode block for Arabic/Persian characters
-                # if text_content and re.search(r'[\u0600-\u06FF]', text_content):
-                #     reshaped_text = arabic_reshaper.reshape(text_content)
-                #     text_content = get_display(reshaped_text)
-
                 # 4. Build Updated JSON Schema
                 msg_dict = {
                     "id": msg.id,
@@ -243,6 +245,178 @@ def register_handlers(client: TelegramClient, chat_id: int) -> None:
         except Exception as e:
             log.error("Fetch failed for %d: %s", target_id, e, exc_info=True)
             await status_msg.edit(f"❌ Fetch failed: {str(e)}")
+
+#endregion
+#region Ask
+
+    @on(r"^/ask\s+(\d+)\s+([\s\S]+)$")
+    async def _(event):
+        if not genai_client:
+            await event.reply("❌ Gemini API key is missing. Please configure GEMINI_API_KEY in your .env file.")
+            return
+
+        index_str = event.pattern_match.group(1)
+        question = event.pattern_match.group(2).strip()
+        
+        try:
+            index = int(index_str)
+        except ValueError:
+            await event.reply("❌ Invalid format. Use: `/ask <index> <question>`")
+            return
+
+        target_id = RECENT_CHATS.get(index)
+        if not target_id:
+            await event.reply(f"❌ Index {index} not found. Please run `/list` or `/find` first.")
+            return
+
+        status_msg = await event.reply(f"📥 Fetching message history from index {index} (safeguarded by token limits)...")
+        
+        try:
+            entity = await client.get_entity(target_id)
+            chat_title = getattr(entity, 'title', 'Unknown Chat')
+            
+            # Determine Base Link for Citations upfront to pass to Gemini
+            chat_id_str = str(target_id)
+            base_link = ""
+            if chat_id_str.startswith("-100"):
+                clean_id = chat_id_str[4:]
+                base_link = f"https://t.me/c/{clean_id}/"
+            elif getattr(entity, 'username', None):
+                base_link = f"https://t.me/{entity.username}/"
+            else:
+                base_link = "https://t.me/c/0/" # Fallback if unroutable
+
+            # Fetch a large buffer (up to 3000), but we will slice it based on character count 
+            # to avoid the 429 Token limit before building the JSON schema or prompt.
+            messages = await client.get_messages(entity, limit=3000)
+            
+            if not messages:
+                await status_msg.edit("❌ No messages found or unable to access history.")
+                return
+
+            # Safeguard: Limit context to ~300,000 characters (approx 75k-100k tokens, well under the 250k free tier limit)
+            MAX_CHARS = 300_000
+            total_chars = 0
+            valid_messages = []
+            
+            # Iterate newest to oldest to keep the most recent context, stopping when limit is reached
+            for msg in messages:
+                text_len = len(msg.text) if msg.text else 0
+                if total_chars + text_len > MAX_CHARS:
+                    log.info("Token safeguard triggered: stopping at %d messages.", len(valid_messages))
+                    break
+                valid_messages.append(msg)
+                total_chars += text_len
+
+            # Reverse to chronological order (oldest -> newest) for the AI prompt and JSON output
+            valid_messages.reverse()
+
+            export_dir = "output"
+            os.makedirs(export_dir, exist_ok=True)
+            filename = os.path.join(export_dir, f"chat_{target_id}_messages.json")
+            
+            structured_data = []
+            ai_context_lines = []
+            
+            for msg in valid_messages:
+                # Resolve Sender Identity
+                sender_id = msg.sender_id
+                sender_username = None
+                sender_name = "Unknown"
+                
+                if msg.sender:
+                    sender_username = getattr(msg.sender, 'username', None)
+                    if sender_username:
+                        sender_username = f"@{sender_username}"
+                        
+                    first = getattr(msg.sender, 'first_name', '') or ''
+                    last = getattr(msg.sender, 'last_name', '') or ''
+                    full_name = f"{first} {last}".strip()
+                    
+                    if full_name:
+                        sender_name = full_name
+                    elif sender_username:
+                        sender_name = sender_username
+                    else:
+                        sender_name = str(sender_id)
+
+                deep_link = f"{base_link}{msg.id}" if base_link != "https://t.me/c/0/" else None
+                text_content = msg.text if msg.text else ""
+
+                # Build Updated JSON Schema
+                msg_dict = {
+                    "id": msg.id,
+                    "timestamp": msg.date.isoformat() if msg.date else None,
+                    "chat_title": chat_title,
+                    "sender": {
+                        "id": sender_id,
+                        "username": sender_username,
+                        "name": sender_name
+                    },
+                    "text": text_content,
+                    "reply_to_id": msg.reply_to_msg_id,
+                    "media_type": type(msg.media).__name__ if msg.media else None,
+                    "deep_link": deep_link
+                }
+                structured_data.append(msg_dict)
+
+                # Append to AI context strictly mapped by message ID to save context window
+                if text_content:
+                    ai_context_lines.append(f"[ID: {msg.id}] {text_content}")
+
+            # Save to JSON file locally
+            with open(filename, "w", encoding="utf-8") as f:
+                json.dump(structured_data, f, ensure_ascii=False, indent=2)
+
+            await status_msg.edit(f"🧠 History retrieved ({len(valid_messages)} messages analyzed). Querying generative AI; please wait...")
+            log.info("Querying Gemini for chat %d with %d contextual messages.", target_id, len(ai_context_lines))
+
+            context_text = "\n".join(ai_context_lines)
+            prompt = f"""
+            You are a highly capable AI Assistant extracting knowledge from Telegram chats. 
+            The user has asked a question. You must answer it based STRICTLY on the provided Chat History.
+
+            User Question: "{question}"
+            Base Link for Citations: {base_link}
+
+            Directives:
+            1. Safety: If the question is unsafe or inappropriate, politely decline to answer.
+            2. Answerability: Determine if the answer actually exists within the Chat History. If the data is insufficient, clearly state that the information is not available in the recent messages. Do not hallucinate outside knowledge.
+            3. Synthesis: If answerable, synthesize a condensed, accurate, and thorough answer based only on the provided history.
+            4. Citation: You MUST cite the most pertinent messages, if any, to prove your claims. To cite, strictly use the markdown format: `[Citation Text](Base Link + ID)`. For example, to cite ID 1234, write `[Message 1234]({base_link}1234)`.
+            5. Language: You MUST write your final response ENTIRELY IN ENGLISH, regardless of the language of the user's question or the chat history.
+
+            Chat History (Format: [ID: <id>] <message content>):
+            {context_text}
+            """
+
+            with open(os.path.join(export_dir, 'prompt.txt'), 'w', encoding='utf-8') as f:
+                f.write(prompt)
+
+            with open(os.path.join(export_dir, 'context.txt'), 'w', encoding='utf-8') as f:
+                f.write(context_text)
+
+            # Execute synchronous Gemini call in a separate thread
+            response = await asyncio.to_thread(
+                genai_client.models.generate_content,
+                model="gemini-3-flash-preview",
+                contents=prompt
+            )
+
+            final_text = response.text
+
+            # Chunking the response in case Gemini generates a message longer than 4096 chars
+            if len(final_text) > 4000:
+                chunks = [final_text[i:i+4000] for i in range(0, len(final_text), 4000)]
+                await status_msg.edit(chunks[0])
+                for chunk in chunks[1:]:
+                    await event.reply(chunk)
+            else:
+                await status_msg.edit(final_text)
+
+        except Exception as e:
+            log.error("Ask failed for %d: %s", target_id, e, exc_info=True)
+            await status_msg.edit(f"❌ Ask command failed: {str(e)}")
 
 #endregion
 
